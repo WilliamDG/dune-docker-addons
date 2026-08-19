@@ -16,6 +16,12 @@ Build and release your addon from your own repository. To list it here, add a ma
 
 See `docs/addon-submission.md` and `docs/addon-manifest.md` for the expected format.
 
+See `docs/addon-upstream-pr-workflow.md` for a reproduction guide to the
+CI workflows, validation scripts, security gates, packaging, and
+catalog-PR automation used by an existing listed addon
+(`dune-ops-observability`), if you want to script the same pipeline for
+your own addon repository.
+
 ## Addon Lifecycle
 
 The community index can mark addons as `active`, `deprecated`, `unsupported`, `removed`, or `blocked`.
