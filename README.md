@@ -16,6 +16,10 @@ Build and release your addon from your own repository. To list it here, add a ma
 
 See `docs/addon-submission.md` and `docs/addon-manifest.md` for the expected format.
 
+See `docs/addon-upstream-pr-workflow.md` for a reusable CI, security,
+release, checksum-verification, and catalog-PR workflow, including
+caveats from an existing addon's automation.
+
 ## Addon Lifecycle
 
 The community index can mark addons as `active`, `deprecated`, `unsupported`, `removed`, or `blocked`.
