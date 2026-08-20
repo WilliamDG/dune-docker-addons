@@ -15,7 +15,51 @@ invented or generalized — if a script takes an argument, the argument
 format shown is the argument format the real script requires. Adapt the
 paths (`web/`, `addon.json`, script names) to your own addon's layout if
 it differs, but the pipeline shape — validate, test, scan, package,
-verify, submit — is the one to reproduce.
+verify, submit — is the one to reproduce. Two steps are the exception:
+see **Known limitations** immediately below before you reproduce
+anything checksum-related.
+
+## Known limitations
+
+**Read this before reproducing the checksum steps in §6–§8.**
+
+Two checks in the reference pipeline don't do what their names imply.
+Both are tracked as bugs in the reference repository
+([#158](https://github.com/yacketrj/dune-ops-observability-addon/issues/158),
+[#159](https://github.com/yacketrj/dune-ops-observability-addon/issues/159))
+and called out here explicitly so nobody reproduces them expecting them
+to work as described.
+
+**1. `validate-release.sh`'s "zip matches `addon.json`" check (§6, check
+4) is structurally unsatisfiable.** It hashes the locally-built
+`dist/*.zip` and compares that hash to the `sha256` field already
+recorded *inside* `addon.json` — but `package.sh` zips `addon.json`
+itself into that same archive (§5). The field being compared is part of
+the content being hashed, so the check would only pass if `addon.json`
+already contained the hash of a zip that contains that exact value — a
+fixed point of SHA-256, not something an edit-and-rezip cycle can
+produce. In the reference repo's own history, `addon.json`'s current
+`sha256` is the real, verified checksum of the published `v0.5.1`
+asset, recorded *after* that asset already existed (§9 step 7) — it
+never could have matched a `dist/` zip built locally before the tag.
+**Do not reproduce this sub-check.** Drop the SHA-equality assertion and
+keep the rest of check 4 (no conflict markers in the unzipped contents,
+version string present in the packaged HTML); use §7's
+`verify-release-asset-checksum.sh` as your one real checksum gate — it
+compares against the actual uploaded release asset, not a local
+pre-release build, and has no such circularity.
+
+**2. `create-upstream-addon-pr.sh`'s "checksum verified" step (§8, Gate
+1) never compares a checksum.** It calls
+`verify-release-asset-checksum.sh "$VERSION"` with no expected-SHA
+argument, then reports `pass "release asset checksum verified"` on
+success. Per §7, that script only compares against an expected value if
+one is passed as a second argument — called this way it only confirms
+the asset downloads. **Fix this when you reproduce it** by passing the
+SHA Gate 0 already extracted:
+```bash
+bash scripts/verify-release-asset-checksum.sh "$VERSION" "$SHA"
+```
 
 Sections: [Repository layout](#1-repository-layout) ·
 [GitHub Actions workflows](#2-the-9-github-actions-workflows) ·
@@ -26,7 +70,8 @@ Sections: [Repository layout](#1-repository-layout) ·
 [Verify release checksum](#7-verify-the-release-asset-checksum) ·
 [Submit the catalog PR](#8-submitting-the-catalog-pr-to-this-repository) ·
 [End-to-end sequence](#9-end-to-end-command-sequence) ·
-[Troubleshooting](#troubleshooting)
+[Troubleshooting](#troubleshooting) ·
+[Appendix: reference-implementation history](#appendix-reference-implementation-history)
 
 ## 1. Repository layout
 
@@ -79,13 +124,17 @@ succeeded before the workflow reports success:
 The `ci-gate` job runs `if: ${{ always() }}` and fails the workflow if
 any of the five upstream jobs did not report `success`.
 
-### `validate.yml` — minimal manifest check
+### `validate.yml`, `secret-scan.yml`, `sast.yml`, `filesystem-scan.yml` — single-purpose gates
 
-Triggers: `pull_request`, `push` to `main`, `workflow_dispatch`.
+All four trigger on `pull_request`, `push` to `main`, and
+`workflow_dispatch`, and each runs exactly one check:
 
-One job, one step: `node scripts/validate.js`. This is the smallest
-possible required check — every other workflow either wraps or extends
-this same script.
+| Workflow | What it runs |
+|---|---|
+| `validate.yml` | `node scripts/validate.js` — the smallest possible required check; every other workflow wraps or extends this same script |
+| `secret-scan.yml` | Full-history checkout (`fetch-depth: 0`), then `gitleaks/gitleaks-action@v3` |
+| `sast.yml` | `python3 -m pip install semgrep==1.170.0`, then `semgrep scan --config p/default --config p/secrets --error` |
+| `filesystem-scan.yml` | `aquasecurity/trivy-action@v0.36.0`, `scan-type: fs`, `scanners: vuln,misconfig,secret`, `severity: CRITICAL,HIGH`, `exit-code: 1` |
 
 ### `pre-commit.yml`
 
@@ -99,27 +148,6 @@ runs:
 ```bash
 pre-commit run --all-files --show-diff-on-failure
 ```
-
-### `secret-scan.yml`
-
-Triggers: `pull_request`, `push` to `main`, `workflow_dispatch`. Full
-history checkout (`fetch-depth: 0`), then `gitleaks/gitleaks-action@v3`.
-
-### `sast.yml`
-
-Triggers: `pull_request`, `push` to `main`, `workflow_dispatch`.
-
-```bash
-python3 -m pip install semgrep==1.170.0
-semgrep scan --config p/default --config p/secrets --error
-```
-
-### `filesystem-scan.yml`
-
-Triggers: `pull_request`, `push` to `main`, `workflow_dispatch`.
-
-`aquasecurity/trivy-action@v0.36.0` with `scan-type: fs`, `scanners:
-vuln,misconfig,secret`, `severity: CRITICAL,HIGH`, `exit-code: 1`.
 
 ### `security-gates.yml` — the scheduled superset
 
@@ -152,54 +180,27 @@ need the token.
 
 ### `release.yml` — tag-triggered release automation
 
-Trigger: `push` of a tag matching `v*`.
+Trigger: `push` of a tag matching `v*`. Calls `scripts/package.sh` (§5)
+but does **not** run `scripts/validate-release.sh` (§6) — that gate is
+a manual, pre-tag step, not part of CI.
 
-> This workflow calls `scripts/package.sh` (detailed in §5) but does
-> **not** run `scripts/validate-release.sh` (§6) automatically — that
-> gate is a manual step you run yourself before tagging, not part of
-> CI. See §5 and §6 for what those two scripts actually do.
-
-Steps, in order:
-
-1. **Full-history checkout** (`fetch-depth: 0`).
+1. Full-history checkout (`fetch-depth: 0`).
 2. **Ancestor guard** — refuses to proceed unless the tagged commit is
-   reachable from `origin/main`:
-   ```bash
-   git fetch origin main
-   git merge-base --is-ancestor "$GITHUB_SHA" origin/main
-   ```
-   This exists because of a real, documented incident: a tag can be
-   created and pushed from a commit that was never merged to `main`,
-   producing a published GitHub Release with no real corresponding
-   point in the project's history. Reproduce this guard in your own
-   `release.yml` — it is a one-command, high-value check.
+   reachable from `origin/main` (`git fetch origin main; git merge-base
+   --is-ancestor "$GITHUB_SHA" origin/main`). Reproduce this in your own
+   `release.yml`: it's a one-command guard against a tag existing with
+   no real corresponding point in the project's history.
 3. **Validate**: `node scripts/validate.js`.
-4. **Tag/manifest version match check**:
-   ```bash
-   ADDON_VERSION="$(node -e "process.stdout.write(require('./addon.json').version)")"
-   TAG_VERSION="${GITHUB_REF_NAME#v}"
-   [ "$ADDON_VERSION" = "$TAG_VERSION" ]
-   ```
+4. **Tag/manifest version match**: `addon.json`'s `version` must equal
+   the tag name with its leading `v` stripped.
 5. **Package**: `bash scripts/package.sh` (§5).
-6. **Generate SBOM** (Software Bill of Materials — a machine-readable
-   dependency inventory, in CycloneDX JSON format). This step can
-   silently no-op (missing `package.json` or a `cyclonedx` install
-   failure both fall through to `|| true`):
-   ```bash
-   npm install --ignore-scripts || true
-   npx @cyclonedx/cyclonedx-npm --output-file dist/sbom.json --output-format json || true
-   ```
+6. **Generate SBOM** (CycloneDX JSON) — best-effort; a missing
+   `package.json` or a failed `cyclonedx` install both silently no-op
+   (`|| true` on both the install and the generate step).
 7. **Create the GitHub Release**, attaching the zip and its `.sha256`
    sidecar unconditionally, and `dist/sbom.json` **only if that file
    was actually produced** in step 6 — if SBOM generation silently
-   no-op'd, the release ships with just the zip and its checksum:
-   ```bash
-   RELEASE_ARGS="$PACKAGE_PATH ${PACKAGE_PATH}.sha256"
-   [ -f dist/sbom.json ] && RELEASE_ARGS="$RELEASE_ARGS dist/sbom.json"
-   gh release create "$GITHUB_REF_NAME" $RELEASE_ARGS \
-     --title "$ADDON_NAME v$ADDON_VERSION" \
-     --notes "Addon package, SHA-256 checksum, and CycloneDX SBOM."
-   ```
+   no-op'd, the release ships with just the zip and its checksum.
 
 ## 3. Validation scripts
 
@@ -224,10 +225,9 @@ Checks, in order:
   policy at validation time rather than by convention alone
 - every `src="..."` reference inside the entry HTML file resolves to a
   real file on disk (cache-busting query strings like `?v=0.5.1` are
-  stripped before the check; `data-src="..."` attributes are
-  deliberately excluded via a negative-lookbehind regex, since this
-  addon uses `data-src` for a lazy-loaded external iframe URL that has
-  no local file to check)
+  stripped before the check; `data-src="..."` attributes are excluded,
+  since this addon uses that attribute for a lazy-loaded external
+  iframe URL with no local file to check)
 - every `.js` file under `web/` at least parses (`new Function(content)`)
 - the version string embedded in the entry HTML file matches
   `addon.json`'s `version`
@@ -241,33 +241,25 @@ Run: `node scripts/check-version-consistency.js`
 
 Hard-fails if `addon.json.version`, `package.json.version`, and the
 version string parsed out of the shipped HTML (`web/index.html`) don't
-all agree. This exists because a version bump that touches some but not
-all three files is always a real bug — these should never legitimately
-disagree.
+all agree — a version bump that touches some but not all three files is
+always a real bug.
 
 Separately (informational only, never fails the build): compares the
-current version against the **latest release tag that is both a valid
-semver tag and an ancestor of `main`** — deliberately not just the
-highest-numbered or most-recently-created tag (see
-`scripts/governance-lib.js` below). Being ahead of the latest real
-release during active development is normal and expected.
+current version against the latest release tag that is both a valid
+semver tag and an ancestor of `main` (see `governance-lib.js` below).
+Being ahead of the latest real release during active development is
+normal and expected.
 
 ### `scripts/governance-lib.js` — shared ancestor-aware tag logic
 
-Not run directly; imported by `check-version-consistency.js`. Provides:
-
-- `isAncestorOfMain(commitish)` — wraps `git merge-base --is-ancestor`
-- `listVersionTags()` — lists all `v*` tags with their peeled commit SHAs
-- `findLatestRealReleaseTag()` — the core anti-fabricated-release
-  mechanism: filters tags to those matching `vMAJOR.MINOR.PATCH` **and**
-  reachable from `main`, then returns the highest version among those.
-  This exists specifically because a naive "highest-numbered tag" or
-  "most-recently-created tag" approach is exactly what let previous
-  fabricated releases pass unnoticed — a tag can look newer while never
-  having been merged to `main`.
-
-If you maintain your own addon, copy this file as-is; it has no
-addon-specific logic.
+Not run directly; imported by `check-version-consistency.js`. Provides
+`isAncestorOfMain(commitish)`, `listVersionTags()`, and
+`findLatestRealReleaseTag()` — the last one filters tags to those
+matching `vMAJOR.MINOR.PATCH` **and** reachable from `main`, deliberately
+rejecting a naive "highest-numbered" or "most-recently-created" tag
+lookup, either of which can be satisfied by a tag that was never merged
+to `main`. If you maintain your own addon, copy this file as-is; it has
+no addon-specific logic.
 
 ### `scripts/check-sri-integrity.js` — Subresource Integrity drift check
 
@@ -276,16 +268,12 @@ Run: `node scripts/check-sri-integrity.js`
 Parses every `<script src="..." integrity="sha384-...">` tag in the
 entry HTML file, recomputes the real SHA-384 of the file each tag
 references, and fails if any declared hash doesn't match the file's
-actual current content.
-
-This exists because of a real, documented incident (GitHub issue #119):
-SRI hashes were hand-maintained, drifted out of sync with the actual
-script content across nine commits, and because SRI failures are
-enforced silently by the browser (no console error, the script simply
-never executes), the addon shipped completely non-functional for over a
-week before anyone noticed. If your addon uses SRI hashes on its
-`<script>` tags at all, reproduce this check and run it in CI — it is a
-zero-false-positive, purely mechanical comparison.
+actual current content. If your addon uses SRI hashes on its `<script>`
+tags at all, reproduce this check and run it in CI — SRI failures are
+enforced silently by the browser (no console error, the script just
+never executes), so drift here is invisible without a mechanical check
+(see the [appendix](#appendix-reference-implementation-history) for what
+that cost this addon in practice).
 
 ### `scripts/update-sri.js` — regenerates the hashes this check verifies
 
@@ -306,17 +294,15 @@ Run: `node scripts/check-bridge-action-drift.js`
 If your addon documents a list of backend API/bridge actions it calls
 (this addon has a "Current bridge-backed actions" table in `README.md`),
 this script extracts every action string actually called in the source
-(`web/data-providers.js`, matching both direct call patterns and wrapper
-call patterns) and fails if the two sets — documented vs. actually
-called — disagree in either direction.
+(`web/data-providers.js`) and fails if the documented set and the
+actually-called set disagree in either direction.
 
 The README-parsing half handles a shorthand table format: a row like
 `` `ops.health.summary.v2` / `.players` / `.farms` `` means three
 actions, not one — every backtick-quoted segment after the first is a
-suffix applied to the base action's 2-segment namespace prefix (here,
-`ops.health`), not a full action string on its own. The script throws a
-hard error (not just a check failure) if a shorthand row's base action
-has fewer than 2 dot-segments, or if a suffix segment doesn't start with
+suffix applied to the base action's 2-segment namespace prefix. The
+script hard-errors (not just a check failure) if a shorthand row's base
+action has fewer than 2 dot-segments, or a suffix doesn't start with
 `.` — both indicate the table itself is malformed, not that code and
 docs merely disagree.
 
@@ -355,50 +341,18 @@ missing:
 DUNE_AUTO_INSTALL_TOOLS=0 bash ops-observability/dev-tools/toolchain-bootstrap.sh
 ```
 
-### `precommit-gate.sh`
+### Single-tool gates: `precommit-gate.sh`, `gitleaks-gate.sh`, `semgrep-gate.sh`, `trivy-gate.sh`
 
-Run: `bash ops-observability/dev-tools/precommit-gate.sh`
+Run each as `bash ops-observability/dev-tools/<script>`. Each wraps one
+tool and, on failure only, parses that tool's raw report into concise
+per-finding lines:
 
-```bash
-pre-commit run --all-files --show-diff-on-failure
-```
-
-with output filtered to just the interesting lines on failure (hook
-names, "Failed", modified-files notices) instead of the full pre-commit
-transcript.
-
-### `gitleaks-gate.sh`
-
-Run: `bash ops-observability/dev-tools/gitleaks-gate.sh`
-
-```bash
-gitleaks detect --source . --no-git --report-format json --report-path <tmp>
-```
-
-On failure, parses the JSON report and prints each finding's file, line,
-and rule ID.
-
-### `semgrep-gate.sh`
-
-Run: `bash ops-observability/dev-tools/semgrep-gate.sh`
-
-```bash
-semgrep scan --error --json-output <tmp>
-```
-
-On failure, parses the JSON and prints each finding's file, line,
-severity, rule ID, and first line of the message.
-
-### `trivy-gate.sh`
-
-Run: `bash ops-observability/dev-tools/trivy-gate.sh`
-
-```bash
-trivy fs --exit-code 1 --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --format json --output <tmp> .
-```
-
-On failure, parses the JSON and prints vulnerabilities, secrets, and
-misconfigurations found, each with target/severity/ID.
+| Script | Underlying command | On failure, prints |
+|---|---|---|
+| `precommit-gate.sh` | `pre-commit run --all-files --show-diff-on-failure` | hook names, "Failed", modified-files notices (not the full transcript) |
+| `gitleaks-gate.sh` | `gitleaks detect --source . --no-git --report-format json --report-path <tmp>` | file, line, rule ID per finding |
+| `semgrep-gate.sh` | `semgrep scan --error --json-output <tmp>` | file, line, severity, rule ID, first line of message per finding |
+| `trivy-gate.sh` | `trivy fs --exit-code 1 --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --format json --output <tmp> .` | vulnerabilities, secrets, misconfigurations, each with target/severity/ID |
 
 ### `security-shift-left.sh` — runs all of the above in one call
 
@@ -408,9 +362,8 @@ In order: toolchain bootstrap, `git diff --check` (merge-conflict-marker
 and whitespace-error scan), `node scripts/validate.js`,
 `precommit-gate.sh`, `gitleaks-gate.sh`, `semgrep-gate.sh`,
 `trivy-gate.sh`. Reports a final `PASS: shift-left security gate` or
-`FAIL: shift-left security gate (<n> failure(s))` summarizing every
-step. **This is the single command to run locally before opening any
-PR.**
+`FAIL: shift-left security gate (<n> failure(s))`. **This is the single
+command to run locally before opening any PR.**
 
 ### `pr-gate.sh` — adds branch/tree hygiene checks on top
 
@@ -452,10 +405,10 @@ pass/fail terminal result.
 
 ### `scripts/validate-and-install-local-console.sh` — private local install
 
-Run: `bash scripts/validate-and-install-local-console.sh`
-(reads `ADDON_REPO` and `CONSOLE_DIR` environment variables, both
-hardcoded to specific local paths by default in the reference script —
-override both for your own machine)
+Run: `bash scripts/validate-and-install-local-console.sh` (reads
+`ADDON_REPO` and `CONSOLE_DIR` environment variables, both hardcoded to
+specific local paths by default in the reference script — override both
+for your own machine)
 
 Syncs your addon repo to `origin/main`, runs `pre-commit run
 --all-files`, `node scripts/validate.js`, and `bash scripts/package.sh`,
@@ -492,6 +445,10 @@ Validates first, then zips exactly `addon.json` plus the `web/`
 directory (adjust to your own addon's shipped-file list), and writes a
 `.sha256` sidecar next to the archive. Requires `node` and `zip` on
 `PATH`; fails immediately with a clear message if either is missing.
+Note that `addon.json` — including whatever `sha256` value it currently
+holds — ends up **inside** this zip; see
+[Known limitations](#known-limitations)
+for why that matters.
 
 ## 6. Release validation gate
 
@@ -504,21 +461,23 @@ Five checks, each printed as `PASS:`/`FAIL:`, with a final pass/fail
 count:
 
 1. **No merge conflict markers** anywhere in `web/`, `scripts/`, or
-   `addon.json` (`grep -rn '<<<<<<<\|=======\|>>>>>>>'`)
+   `addon.json`.
 2. **`addon.json`'s version matches** the version argument, and
-   `node scripts/validate.js` passes
-3. **No stale version labels** in the shipped HTML. Note: the real
-   script's pattern here is a literal, hardcoded string
-   (`grep -nE 'v0\.3\.0|Release 0\.3[^.]'` — a leftover from an old
-   release), not a dynamically computed "previous version" — reproduce
-   this as a pattern you manually update after each release, not as a
-   self-updating check.
-4. **The most recently built zip's SHA-256 matches** `addon.json`'s
-   recorded `sha256`, the unzipped contents have no conflict markers,
-   and the version string appears at least once in the packaged HTML
+   `node scripts/validate.js` passes.
+3. **No stale version labels** in the shipped HTML — the real script's
+   pattern here is a literal, hardcoded string left over from an old
+   release (`v0\.3\.0|Release 0\.3[^.]`), not a dynamically computed
+   "previous version." Reproduce this as a pattern you manually update
+   after each release, not as a self-updating check.
+4. **The most recently built zip's SHA-256 matches `addon.json`'s
+   recorded `sha256`** — **do not reproduce this comparison as
+   written; see [Known limitations](#known-limitations)**
+   — plus (safe to keep): the unzipped contents have no conflict
+   markers, and the version string appears at least once in the
+   packaged HTML.
 5. **`SKIP="trivy,semgrep" pre-commit run --all-files`** passes
    (trivy/semgrep are deliberately skipped here — they're already
-   covered by the security gates in §4)
+   covered by the security gates in §4).
 
 Run this after `scripts/package.sh` and before tagging. It exits
 non-zero with "Release validation FAILED" if any check fails.
@@ -543,9 +502,12 @@ Downloads the **actual uploaded GitHub Release asset** (not your local
 `dist/` copy — local zip contents can legitimately differ from what
 GitHub serves) and computes its SHA-256. If you pass a second argument,
 it's compared against the downloaded file's real checksum and the
-script exits non-zero on any mismatch. It always prints the exact
-`version` / `downloadUrl` / `sha256` fields to paste into a catalog
-manifest:
+script exits non-zero on any mismatch — **always pass it**; called
+without it, this script only proves the asset downloads, not that it's
+the asset you think it is (see
+[Known limitations](#known-limitations)).
+It always prints the exact `version` / `downloadUrl` / `sha256` fields
+to paste into a catalog manifest:
 
 ```text
 Community manifest fields:
@@ -567,9 +529,10 @@ Run: `bash scripts/create-upstream-addon-pr.sh <version> [--draft]`
 
 This is the script that opens the actual pull request against this
 catalog repository (`Red-Blink/dune-docker-addons`). It requires you to
-have already forked this repository and cloned that fork locally. Its
-internal stages are numbered "Gate 0" through "Gate 4" (five stages,
-zero-indexed) and run in order:
+have already forked this repository and cloned that fork locally, at a
+stable, permanent path (not scratch space you might later clean up).
+Its internal stages are numbered "Gate 0" through "Gate 4" and run in
+order:
 
 **Gate 0 — Preflight** (runs in your addon repo): reads `addon.json`,
 confirms its `version` matches the argument you passed, extracts
@@ -579,16 +542,13 @@ confirms its `version` matches the argument you passed, extracts
 ```bash
 node scripts/validate.js
 SKIP="trivy,semgrep" pre-commit run --all-files
-bash scripts/verify-release-asset-checksum.sh "$VERSION"
+bash scripts/verify-release-asset-checksum.sh "$VERSION" "$SHA"   # pass $SHA — see Known limitations
 ```
-Note: `verify-release-asset-checksum.sh` is called here with **no
-expected-checksum argument**, so this step only confirms the release
-asset exists and downloads successfully — it does **not** compare the
-downloaded asset against `addon.json`'s recorded `sha256`. That
-comparison only happens if you separately run
-`verify-release-asset-checksum.sh <version> <expected-sha>` yourself
-(§7). trivy/semgrep are skipped here since they're already covered by
-the security gates in §4.
+trivy/semgrep are skipped here since they're already covered by the
+security gates in §4. **The real reference script omits `"$SHA"` on the
+third line** — see
+[Known limitations](#known-limitations)
+for why that's a bug to fix, not reproduce.
 
 **Gate 2 — Catalog branch** (runs in your local clone of your fork of
 this repository):
@@ -603,7 +563,9 @@ this for the same version), then copies your `addon.json` to
 `addons/<your-addon-id>.json`, sets its `version` and `sha256` to the
 verified values from Gate 0, and updates your addon's short entry in
 `index.json` (`version`, `description` — read live from your real
-`addon.json`, never hardcoded).
+`addon.json`, never hardcoded; a hardcoded copy will silently drift the
+first time you edit your real `addon.json` without also editing the
+script).
 
 **Gate 3 — Commit and push**:
 ```bash
@@ -626,7 +588,7 @@ gh pr create --repo Red-Blink/dune-docker-addons \
   # as the script's second argument
 ```
 
-The real script generates the PR body below. Several fields are **not**
+The real script generates the PR body below. Some fields are **not**
 dynamic per-release content — reproduce these limitations faithfully,
 or improve on them in your own copy:
 
@@ -663,17 +625,16 @@ This release updates the addon catalog entry for version <version> with the veri
 Notes on the fields above, cross-checked against the real script:
 
 - **"Why is it needed?"** is always the fixed boilerplate sentence
-  shown — the script never generates real per-release changelog
-  content here. Edit it by hand after the script runs if you want the
-  PR to actually explain what changed.
+  shown — edit it by hand after the script runs if you want the PR to
+  actually explain what changed.
 - **"Release tag"** uses the bare version you passed as the CLI
-  argument (no `v` prefix) — this does not match the real git tag name
-  (`v<version>`) and is a known inconsistency in the reference script.
-- **"Test output"** is not general test-suite output; it is
-  specifically `verify-release-asset-checksum.sh`'s last 5 lines.
-- **"Security output"** is not an aggregation of pre-commit/gitleaks/
-  semgrep/trivy results; it only reads a `.security-reports/
-  secret-keyword-review.txt` file if one happens to exist at that path.
+  argument (no `v` prefix), which does not match the real git tag name
+  (`v<version>`) — a known inconsistency in the reference script.
+- **"Test output"** is specifically `verify-release-asset-checksum.sh`'s
+  last 5 lines, not general test-suite output.
+- **"Security output"** only reads a `.security-reports/
+  secret-keyword-review.txt` file if one happens to exist at that path —
+  it is not an aggregation of pre-commit/gitleaks/semgrep/trivy results.
 - This PR body structure is not required by `docs/addon-submission.md`
   in this repository (which has no PR-template requirement of its own)
   — it is simply what the reference script happens to produce.
@@ -682,27 +643,21 @@ Notes on the fields above, cross-checked against the real script:
 
 Copy `scripts/create-upstream-addon-pr.sh`, then change only:
 
-- `CATALOG_REPO="${HOME}/dune-docker-addons"` → your local clone path of
-  your fork of this repository
+- `CATALOG_REPO` → your local clone path of your fork of this
+  repository (a permanent path, not scratch space)
 - `UPSTREAM="Red-Blink/dune-docker-addons"` → stays the same if
   submitting here
 - every `dune-ops-observability` string → your own addon's `id`
 - the PR body's addon name and description → read live from your own
-  `addon.json`, never hardcoded (a hardcoded description silently
-  drifts from reality the first time you edit your real `addon.json`
-  without also editing the script — this happened in the reference
-  implementation and was a real, found bug)
+  `addon.json`, never hardcoded
+- Gate 1's checksum-verification call → pass the expected SHA (see
+  [Known limitations](#known-limitations))
 
-Two path pitfalls confirmed from the reference implementation's own
-history, worth checking in your copy:
-
-- If your script lives at `<repo-root>/scripts/`, the repo root is
-  `$SCRIPT_DIR/..` (one level up), not two — a one-directory-too-far bug
-  here silently fails Gate 0 looking for `addon.json` in the wrong
-  place.
-- Give your catalog fork clone a stable, permanent path outside any
-  directory you might later clean up as scratch space — losing the
-  clone this way happened once in the reference implementation.
+If your script lives at `<repo-root>/scripts/`, the repo root is
+`$SCRIPT_DIR/..` (one level up) — a one-directory-too-far bug here
+silently fails Gate 0 looking for `addon.json` in the wrong place (see
+the [appendix](#appendix-reference-implementation-history) for how this
+bit the reference implementation).
 
 ### Tracking PR status after submission
 
@@ -723,7 +678,7 @@ Run in order, from your addon repository's root, after you've bumped
 run unconditionally on every PR/push — include them as shown below if
 you reproduce this pipeline as-is; omit those two lines only if your
 addon genuinely has no SRI hashes to check or no bridge/API-action
-table to keep in sync (see §3 for what each one actually checks):
+table to keep in sync (see §3).
 
 ```bash
 # One-time per machine: install/verify the toolchain
@@ -742,7 +697,8 @@ bash ops-observability/dev-tools/security-shift-left.sh
 # 3. Build the package
 bash scripts/package.sh
 
-# 4. Run the release-validation gate
+# 4. Run the release-validation gate (skip check 4's SHA-equality
+#    assertion if you copied it verbatim — see Known limitations)
 bash scripts/validate-release.sh <version>          # bare version, e.g. 0.5.1
 
 # 5. Tag and push — this triggers release.yml
@@ -751,14 +707,15 @@ git push origin v<version>
 
 # 6. Wait for the release workflow, then verify the uploaded asset for real
 gh run watch $(gh run list --workflow=release.yml --limit 1 --json databaseId -q '.[0].databaseId')
-bash scripts/verify-release-asset-checksum.sh <version>
+bash scripts/verify-release-asset-checksum.sh <version> <expected-sha256>
 
 # 7. Record the verified checksum in addon.json, commit it
 git add addon.json
 git commit -m "chore: record verified release checksum for v<version>"
 git push origin main
 
-# 8. Submit the catalog PR to this repository
+# 8. Submit the catalog PR to this repository (with Gate 1 fixed
+#    to pass the expected SHA — see Known limitations)
 bash scripts/create-upstream-addon-pr.sh <version>
 ```
 
@@ -770,6 +727,7 @@ bash scripts/create-upstream-addon-pr.sh <version>
 | `check-sri-integrity.js` fails | You edited a script/stylesheet without regenerating its declared hash | `node scripts/update-sri.js`, then re-run the check |
 | `check-version-consistency.js` fails | `addon.json`, `package.json`, and the shipped HTML disagree on version | Update whichever file(s) you missed during the version bump |
 | `check-bridge-action-drift.js` fails | Your docs list an action your code doesn't call, or vice versa | Update whichever side is stale — this check has no false positives, both sides must genuinely match |
+| `validate-release.sh` check 4 always fails on the SHA comparison | The check compares the local zip's hash against a value embedded inside that same zip — structurally can't pass (see Known limitations) | Drop that assertion; rely on `verify-release-asset-checksum.sh` (§7) instead |
 | `create-upstream-addon-pr.sh` fails at Gate 0 | `addon.json` version doesn't match the argument, or you passed a `v`-prefixed version where a bare one is expected | Pass the bare version (`0.5.1`, not `v0.5.1`) matching `addon.json` exactly |
 | `create-upstream-addon-pr.sh`'s commit step needs `--no-verify` | This catalog repository has no `.pre-commit-config.yaml` of its own | Expected — your addon repo's real checks already ran in Gate 1 |
 | `verify-release-asset-checksum.sh` reports a mismatch | You compared against a local zip instead of the real uploaded asset | Always run it against the real download URL; never trust `sha256sum dist/*.zip` alone as your final checksum |
@@ -781,3 +739,37 @@ bash scripts/create-upstream-addon-pr.sh <version>
 - [Addon Manifest](addon-manifest.md) — the exact manifest fields this
   catalog validates against, and the separate lifecycle metadata that
   lives in `index.json`
+
+## Appendix: reference-implementation history
+
+Not part of the pipeline to reproduce — background on bugs already
+found and fixed in the reference repository, kept here for context
+rather than in the main flow above.
+
+- **SRI hash drift (issues [#119](https://github.com/yacketrj/dune-ops-observability-addon/issues/119),
+  [#124](https://github.com/yacketrj/dune-ops-observability-addon/issues/124)):**
+  hand-maintained SRI hashes drifted out of sync with actual script
+  content across nine commits. Because SRI failures are enforced
+  silently by the browser (no console error, the script simply never
+  executes), the addon shipped completely non-functional for over a
+  week before anyone noticed — the reason `check-sri-integrity.js` /
+  `update-sri.js` (§3) exist.
+- **`create-upstream-addon-pr.sh` path bug:** an earlier version
+  computed the addon repo root as two directories up from the script
+  (`$SCRIPT_DIR/../..`) instead of one, resolving to the parent of the
+  repo entirely and failing Gate 0 on every real invocation.
+- **PR-body description drift:** the script used to hardcode the
+  addon's name/description directly in its PR-body template instead of
+  reading them from `addon.json`, and drifted out of sync with the real
+  manifest across several releases before anyone noticed.
+- **Catalog fork clone location:** an earlier version pointed
+  `CATALOG_REPO` at a clone nested inside a scratch directory that was
+  later deleted during an unrelated cleanup, losing the clone. The
+  clone needs a stable, permanent path outside anything you might later
+  clean up as scratch space.
+- **`validate-release.sh` check 3's version-label threshold:** an
+  earlier version required at least 3 version-label occurrences in the
+  shipped HTML, a threshold the addon's real markup (exactly one
+  version label, in the `<h1>`) never satisfied — silently failing or
+  being bypassed on every real release until corrected to match what
+  the markup actually contains.
