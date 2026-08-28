@@ -3,12 +3,13 @@
   "name": "Fluffy Fox Status",
   "description": "Hardware and system monitoring addon for Dune Docker Console.",
   "author": "SugarFluff WildHeart",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "type": "ui",
   "sourceUrl": "https://github.com/SugarFluff-WildHeart/FluffyFox-Status",
-  "downloadUrl": "https://github.com/SugarFluff-WildHeart/FluffyFox-Status/releases/download/v0.2.3/fluffy-fox-status-0.2.3.zip",
-  "sha256": "77b05c6c9541b449678aa2824dea8f1d6977374c5a2aa5408b1fc3b1ea43fc8e",
+  "downloadUrl": "https://github.com/SugarFluff-WildHeart/FluffyFox-Status/releases/download/v0.3.0/fluffy-fox-status-0.3.0.zip",
+  "sha256": "727970bdb2a08791c94417324f970f3e5abed796fdf339abbf0db54009036da8",
   "permissions": {
-    "server": ["status"]
+    "server": ["status"],
+    "ops": ["read"]
   }
 }
